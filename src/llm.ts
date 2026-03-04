@@ -726,7 +726,7 @@ export class LlamaCpp implements LLM {
   // Qwen3 reranker template adds ~200 tokens overhead (system prompt, tags, etc.)
   // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
   // Use 2048 for safety margin. Still 17× less than auto (40960).
-  private static readonly RERANK_CONTEXT_SIZE = 2048;
+  private static readonly RERANK_CONTEXT_SIZE = 4096;
 
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
@@ -1389,14 +1389,23 @@ export function canUnloadLLM(): boolean {
 // Singleton for default LlamaCpp instance
 // =============================================================================
 
-let defaultLlamaCpp: LlamaCpp | null = null;
+let defaultLlamaCpp: LLM | null = null;
 
 /**
- * Get the default LlamaCpp instance (creates one if needed)
+ * Get the default LLM instance.
+ * When QMD_REMOTE_MODE=1 is set, returns a RemoteLlamaCpp that delegates
+ * to remote llama-server instances via HTTP instead of loading models locally.
+ * Otherwise creates a local LlamaCpp instance using node-llama-cpp.
  */
-export function getDefaultLlamaCpp(): LlamaCpp {
+export function getDefaultLlamaCpp(): LLM {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    if (process.env.QMD_REMOTE_MODE === "1") {
+      // Lazy import to avoid pulling in the remote module when not needed
+      const { RemoteLlamaCpp } = require("./llm-remote.js");
+      defaultLlamaCpp = new RemoteLlamaCpp();
+    } else {
+      defaultLlamaCpp = new LlamaCpp();
+    }
   }
   return defaultLlamaCpp;
 }
@@ -1404,7 +1413,7 @@ export function getDefaultLlamaCpp(): LlamaCpp {
 /**
  * Set a custom default LlamaCpp instance (useful for testing)
  */
-export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
+export function setDefaultLlamaCpp(llm: LLM | null): void {
   defaultLlamaCpp = llm;
 }
 
