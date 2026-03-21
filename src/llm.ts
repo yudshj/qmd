@@ -311,11 +311,26 @@ export async function pullModels(
 /**
  * Abstract LLM interface - implement this for different backends
  */
+/**
+ * Error thrown when the reranker endpoint is not available or not supported.
+ */
+export class RerankNotSupportedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RerankNotSupportedError";
+  }
+}
+
 export interface LLM {
   /**
    * Get embeddings for text
    */
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
+
+  /**
+   * Batch embeddings for multiple texts
+   */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
 
   /**
    * Generate text completion
@@ -331,13 +346,34 @@ export interface LLM {
    * Expand a search query into multiple variations for different backends.
    * Returns a list of Queryable objects.
    */
-  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean, intent?: string }): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
    * Returns list of documents with relevance scores (higher = more relevant)
    */
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
+
+  /**
+   * Tokenize text (for chunk sizing). Remote backends may use byte-level fallback.
+   */
+  tokenize(text: string): Promise<readonly unknown[]>;
+
+  /**
+   * Detokenize tokens back to text.
+   */
+  detokenize(tokens: readonly unknown[]): Promise<string>;
+
+  /**
+   * Get device/GPU info for status display.
+   */
+  getDeviceInfo(): Promise<{
+    gpu: string | false;
+    gpuOffloading: boolean;
+    gpuDevices: string[];
+    vram?: { total: number; used: number; free: number };
+    cpuCores: number;
+  }>;
 
   /**
    * Dispose of resources
@@ -1274,11 +1310,11 @@ export class LlamaCpp implements LLM {
  * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: LLM;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: LLM) {
     this.llm = llm;
   }
 
@@ -1314,7 +1350,7 @@ class LLMSessionManager {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
   }
 
-  getLlamaCpp(): LlamaCpp {
+  getLLM(): LLM {
     return this.llm;
   }
 }
@@ -1417,18 +1453,18 @@ class LLMSession implements ILLMSession {
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, options));
+    return this.withOperation(() => this.manager.getLLM().embed(text, options));
   }
 
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts));
+    return this.withOperation(() => this.manager.getLLM().embedBatch(texts));
   }
 
   async expandQuery(
     query: string,
     options?: { context?: string; includeLexical?: boolean }
   ): Promise<Queryable[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().expandQuery(query, options));
+    return this.withOperation(() => this.manager.getLLM().expandQuery(query, options));
   }
 
   async rerank(
@@ -1436,7 +1472,7 @@ class LLMSession implements ILLMSession {
     documents: RerankDocument[],
     options?: RerankOptions
   ): Promise<RerankResult> {
-    return this.withOperation(() => this.manager.getLlamaCpp().rerank(query, documents, options));
+    return this.withOperation(() => this.manager.getLLM().rerank(query, documents, options));
   }
 }
 
@@ -1448,7 +1484,7 @@ let defaultSessionManager: LLMSessionManager | null = null;
  */
 function getSessionManager(): LLMSessionManager {
   const llm = getDefaultLlamaCpp();
-  if (!defaultSessionManager || defaultSessionManager.getLlamaCpp() !== llm) {
+  if (!defaultSessionManager || defaultSessionManager.getLLM() !== llm) {
     defaultSessionManager = new LLMSessionManager(llm);
   }
   return defaultSessionManager;
@@ -1487,7 +1523,7 @@ export async function withLLMSession<T>(
  * Unlike withLLMSession, this does not use the global singleton.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
@@ -1511,16 +1547,32 @@ export function canUnloadLLM(): boolean {
 }
 
 // =============================================================================
-// Singleton for default LlamaCpp instance
+// Singleton for default LLM instance
 // =============================================================================
 
-let defaultLlamaCpp: LlamaCpp | null = null;
+let defaultLlamaCpp: LLM | null = null;
 
 /**
- * Get the default LlamaCpp instance (creates one if needed)
+ * Initialize the remote LLM backend (must be called before getDefaultLlamaCpp
+ * when QMD_REMOTE_MODE=1). Safe to call multiple times.
  */
-export function getDefaultLlamaCpp(): LlamaCpp {
+export async function initRemoteLlamaCpp(): Promise<void> {
+  if (process.env.QMD_REMOTE_MODE === "1" && !defaultLlamaCpp) {
+    const { RemoteLlamaCpp } = await import("./llm-remote.js");
+    defaultLlamaCpp = new RemoteLlamaCpp();
+  }
+}
+
+/**
+ * Get the default LLM instance.
+ * When QMD_REMOTE_MODE=1, requires initRemoteLlamaCpp() to have been called first.
+ * Otherwise creates a local LlamaCpp instance using node-llama-cpp.
+ */
+export function getDefaultLlamaCpp(): LLM {
   if (!defaultLlamaCpp) {
+    if (process.env.QMD_REMOTE_MODE === "1") {
+      throw new Error("Remote mode enabled but initRemoteLlamaCpp() was not called. Call it before using getDefaultLlamaCpp().");
+    }
     const embedModel = process.env.QMD_EMBED_MODEL;
     defaultLlamaCpp = new LlamaCpp(embedModel ? { embedModel } : {});
   }
@@ -1528,9 +1580,9 @@ export function getDefaultLlamaCpp(): LlamaCpp {
 }
 
 /**
- * Set a custom default LlamaCpp instance (useful for testing)
+ * Set a custom default LLM instance (useful for testing)
  */
-export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
+export function setDefaultLlamaCpp(llm: LLM | null): void {
   defaultLlamaCpp = llm;
 }
 
